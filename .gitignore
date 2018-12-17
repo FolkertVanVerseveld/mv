@@ -1,0 +1,6 @@
+# CC
+*.o
+
+server
+shell
+client
