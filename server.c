@@ -18,6 +18,7 @@
 
 #include "dbg.h"
 
+// TODO reuse hlist.c
 // TODO reuse daemon.c
 
 typedef uint16_t block_t;
@@ -25,8 +26,12 @@ typedef uint16_t block_t;
 #define ID_AIR 0
 #define ID_STONE 1
 
-#define ONT_SIDE_MASK 0x0f
-#define ONT_TYPE_MASK 0xf0
+#define ONT_SIDE_MASK 0x000f
+#define ONT_TYPE_MASK 0x00f0
+
+// TODO use for (un)marking blocks
+// TODO use for unsplit
+#define ONT_CELL_MASK 0x0f00
 
 #define ONT_CELL 0x10
 #define ONT_SPLIT 0x20
@@ -53,7 +58,7 @@ struct ot_pool {
 	// Size of root node in blocks, must be power of 2 and at least 2.
 	unsigned root_size;
 } ot_pool = {
-	ot_nodes, 0, 0, 8
+	ot_nodes, 0, 0, 256
 };
 
 void ot_split(struct ot_pool *o, struct ot_node *n)
@@ -77,51 +82,52 @@ void ot_split(struct ot_pool *o, struct ot_node *n)
 	o->count += 8;
 }
 
+static inline unsigned cell_get_pos(int cx, int cy, int cz, int x, int y, int z)
+{
+	int dx, dy, dz;
+
+	dx = x >= cx;
+	dy = y >= cy;
+	dz = z >= cz;
+
+	return (dz << 2) + (dy << 1) + dx;
+}
+
+static inline void cell_pos_update(int *size, int *cx, int *cy, int *cz, int x, int y, int z)
+{
+	*size >>= 1;
+
+	*cx = x >= *cx ? *cx + *size : *cx - *size;
+	*cy = y >= *cy ? *cy + *size : *cy - *size;
+	*cz = z >= *cz ? *cz + *size : *cz - *size;
+}
+
 block_t ot_get_cell(const struct ot_pool *o, int x, int y, int z)
 {
 	// ignore if position out of boundaries
 	int size = (int)(o->root_size >> 1);
 
-	if (!o->count)
+	assert(o->count);
+
+	if (z < -size || y < -size || x < -size || z >= size || y >= size || x >= size)
 		return ID_AIR;
 
-	if (z < -size || y < -size || x < -size)
-		return ID_AIR;
-	if (z >= size || y >= size || x >= size)
-		return ID_AIR;
-
-	int cx, cy, cz;
-	unsigned dx, dy, dz, pos;
-
-	cx = cy = cz = 0;
+	int cx = 0, cy = 0, cz = 0;
+	unsigned pos;
 
 	struct ot_node *node = &o->nodes[o->root];
 
 	while (size > 1) {
-		dx = x >= cx ? 1 : 0;
-		dy = y >= cy ? 1 : 0;
-		dz = z >= cz ? 1 : 0;
-
-		pos = (dz << 2) + (dy << 1) + dx;
+		pos = cell_get_pos(cx, cy, cz, x, y, z);
 
 		if ((node->type & ONT_TYPE_MASK) == ONT_CELL)
 			return node->data.cells[pos];
 
 		node = &node->data.children[pos];
-
-		size >>= 1;
-
-		cx = x >= cx ? cx + size : cx - size;
-		cy = y >= cy ? cy + size : cy - size;
-		cz = z >= cz ? cz + size : cz - size;
+		cell_pos_update(&size, &cx, &cy, &cz, x, y, z);
 	}
 
-	dx = x >= cx ? 1 : 0;
-	dy = y >= cy ? 1 : 0;
-	dz = z >= cz ? 1 : 0;
-
-	pos = (dz << 2) + (dy << 1) + dx;
-
+	pos = cell_get_pos(cx, cy, cz, x, y, z);
 	return node->data.cells[pos];
 }
 
@@ -130,10 +136,11 @@ void ot_set_cell(struct ot_pool *o, int x, int y, int z, block_t id)
 	// ignore if position out of boundaries
 	int size = (int)(o->root_size >> 1);
 
-	if (z < -size || y < -size || x < -size)
+	if (z < -size || y < -size || x < -size || z >= size || y >= size || x >= size)
 		return;
-	if (z >= size || y >= size || x >= size)
-		return;
+
+	int cx = 0, cy = 0, cz = 0;
+	unsigned pos;
 
 	// ensure there's an initial node
 	if (!o->count) {
@@ -150,99 +157,49 @@ void ot_set_cell(struct ot_pool *o, int x, int y, int z, block_t id)
 				((z + 1) << 2) + ((y + 1) << 1) + (x + 1)
 			] = id;
 		else {
-			int cx, cy, cz;
-			unsigned dx, dy, dz, pos;
-
-			cx = cy = cz = 0;
-
 			while (size > 1) {
-				dx = x >= cx ? 1 : 0;
-				dy = y >= cy ? 1 : 0;
-				dz = z >= cz ? 1 : 0;
-
-				pos = (dz << 2) + (dy << 1) + dx;
-
-				dbgf("split: %u, %d, %d, %d (%d, %d, %d)\n", pos, dx, dy, dz, cx, cy, cz);
+				dbgf("split: %u, (%d, %d, %d)\n", pos, cx, cy, cz);
 				ot_split(o, node);
 
+				pos = cell_get_pos(cx, cy, cz, x, y, z);
 				node = &node->data.children[pos];
 
-				size >>= 1;
-
-				cx = x >= cx ? cx + size : cx - size;
-				cy = y >= cy ? cy + size : cy - size;
-				cz = z >= cz ? cz + size : cz - size;
+				cell_pos_update(&size, &cx, &cy, &cz, x, y, z);
 			}
 
 			// node has been split into size 2, now put block there
-
-			dx = x >= cx ? 1 : 0;
-			dy = y >= cy ? 1 : 0;
-			dz = z >= cz ? 1 : 0;
-
-			pos = (dz << 2) + (dy << 1) + dx;
-
-			dbgf("put  : %u, %d, %d, %d (%d, %d, %d)\n", pos, dx, dy, dz, cx, cy, cz);
-
-			node->data.cells[pos] = id;
+			goto put;
 		}
 		return;
 	}
 
 	// strategy: find closest node, split if bigger than 2, put block
-	int cx, cy, cz;
-	unsigned dx, dy, dz, pos;
-
-	cx = cy = cz = 0;
 
 	while (size > 1) {
 		if ((node->type & ONT_TYPE_MASK) == ONT_CELL) {
 			while (size > 1) {
-				dx = x >= cx ? 1 : 0;
-				dy = y >= cy ? 1 : 0;
-				dz = z >= cz ? 1 : 0;
-
-				pos = (dz << 2) + (dy << 1) + dx;
-
-				dbgf("split: %u, %d, %d, %d (%d, %d, %d)\n", pos, dx, dy, dz, cx, cy, cz);
+				dbgf("split: %u, (%d, %d, %d)\n", pos, cx, cy, cz);
 				ot_split(o, node);
 
+				pos = cell_get_pos(cx, cy, cz, x, y, z);
 				node = &node->data.children[pos];
 
-				size >>= 1;
-
-				cx = x >= cx ? cx + size : cx - size;
-				cy = y >= cy ? cy + size : cy - size;
-				cz = z >= cz ? cz + size : cz - size;
+				cell_pos_update(&size, &cx, &cy, &cz, x, y, z);
 			}
 			break;
 		}
 
-		dx = x >= cx ? 1 : 0;
-		dy = y >= cy ? 1 : 0;
-		dz = z >= cz ? 1 : 0;
-
-		pos = (dz << 2) + (dy << 1) + dx;
-
+		pos = cell_get_pos(cx, cy, cz, x, y, z);
 		node = &node->data.children[pos];
 
-		dbgf("search: %u, %d, %d, %d (%d, %d, %d)\n", pos, dx, dy, dz, cx, cy, cz);
+		dbgf("search: %u, (%d, %d, %d)\n", pos, cx, cy, cz);
 
-		size >>= 1;
-
-		cx = x >= cx ? cx + size : cx - size;
-		cy = y >= cy ? cy + size : cy - size;
-		cz = z >= cz ? cz + size : cz - size;
+		cell_pos_update(&size, &cx, &cy, &cz, x, y, z);
 	}
 
-	dx = x >= cx ? 1 : 0;
-	dy = y >= cy ? 1 : 0;
-	dz = z >= cz ? 1 : 0;
-
-	pos = (dz << 2) + (dy << 1) + dx;
-
-	dbgf("put  : %u, %d, %d, %d (%d, %d, %d)\n", pos, dx, dy, dz, cx, cy, cz);
-
+put:
+	pos = cell_get_pos(cx, cy, cz, x, y, z);
+	dbgf("put  : %u, (%d, %d, %d)\n", pos, cx, cy, cz);
 	node->data.cells[pos] = id;
 }
 
