@@ -7,6 +7,7 @@
  * Copyright Folkert van Verseveld. All rights reserved.
  */
 #include <stdio.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
@@ -25,6 +26,7 @@ typedef uint16_t block_t;
 
 #define ID_AIR 0
 #define ID_STONE 1
+#define ID_GRASS 2
 
 #define ONT_SIDE_MASK 0x000f
 #define ONT_TYPE_MASK 0x00f0
@@ -47,39 +49,62 @@ struct ot_node {
 	} data;
 };
 
-#define OT_NODES_COUNT 256
-
-struct ot_node ot_nodes[OT_NODES_COUNT];
-
 // TODO add cap, flags for resize
 struct ot_pool {
 	struct ot_node *nodes;
-	size_t root, count;
+	// index to first node.
+	size_t root;
+	// number of nodes and total capacity.
+	size_t count, cap;
 	// Size of root node in blocks, must be power of 2 and at least 2.
 	unsigned root_size;
-} ot_pool = {
-	ot_nodes, 0, 0, 256
-};
+} ot_pool;
 
-void ot_split(struct ot_pool *o, struct ot_node *n)
+int ot_init(struct ot_pool *o, size_t cap, unsigned size)
 {
-	if (o->count + 8 >= OT_NODES_COUNT) {
-		fputs("node overflow\n", stderr);
-		exit(1);
-	}
+	struct ot_node *nodes;
 
+	if (cap < 8 || size < 2 || (size & (size - 1)))
+		return EINVAL;
+
+	if (!(nodes = malloc(cap * sizeof *nodes)))
+		return ENOMEM;
+
+	o->nodes = nodes;
+	o->count = 0;
+	o->cap = cap;
+	o->root_size = size;
+
+	return 0;
+}
+
+void ot_free(struct ot_pool *o)
+{
+	free(o->nodes);
+}
+
+int ot_split(struct ot_pool *o, struct ot_node *n)
+{
 	assert((n->type & ONT_TYPE_MASK) == ONT_CELL);
+
+	if (o->count >= o->cap - 8)
+		return ENOMEM;
 
 	struct ot_node *children = &o->nodes[o->count];
 
 	for (unsigned i = 0; i < 8; ++i) {
 		children[i].parent = n;
 		children[i].type = ONT_CELL | i;
+
+		for (unsigned j = 0; j < 8; ++j)
+			children[i].data.cells[j] = 0;
 	}
 
 	n->data.children = children;
 	n->type = (n->type & ONT_SIDE_MASK) | ONT_SPLIT;
 	o->count += 8;
+
+	return 0;
 }
 
 static inline unsigned cell_get_pos(int cx, int cy, int cz, int x, int y, int z)
@@ -104,10 +129,10 @@ static inline void cell_pos_update(int *size, int *cx, int *cy, int *cz, int x, 
 
 block_t ot_get_cell(const struct ot_pool *o, int x, int y, int z)
 {
+	assert(o->count);
+
 	// ignore if position out of boundaries
 	int size = (int)(o->root_size >> 1);
-
-	assert(o->count);
 
 	if (z < -size || y < -size || x < -size || z >= size || y >= size || x >= size)
 		return ID_AIR;
@@ -131,13 +156,17 @@ block_t ot_get_cell(const struct ot_pool *o, int x, int y, int z)
 	return node->data.cells[pos];
 }
 
-void ot_set_cell(struct ot_pool *o, int x, int y, int z, block_t id)
+int ot_set_cell(struct ot_pool *o, int x, int y, int z, block_t id)
 {
+	// TODO merge blocks where are cells are set to ID_AIR
+	int error;
+
 	// ignore if position out of boundaries
 	int size = (int)(o->root_size >> 1);
 
 	if (z < -size || y < -size || x < -size || z >= size || y >= size || x >= size)
-		return;
+		// TODO resize
+		return ERANGE;
 
 	int cx = 0, cy = 0, cz = 0;
 	unsigned pos;
@@ -152,16 +181,18 @@ void ot_set_cell(struct ot_pool *o, int x, int y, int z, block_t id)
 
 	// if root node is a cell, keep splitting if size > 2
 	if ((node->type & ONT_TYPE_MASK) == ONT_CELL) {
-		if (size == 1)
-			node->data.cells[
-				((z + 1) << 2) + ((y + 1) << 1) + (x + 1)
-			] = id;
-		else {
+		if (size == 1) {
+			pos = ((z + 1) << 2) + ((y + 1) << 1) + (x + 1);
+			node->data.cells[pos] = id;
+			node->type |= 0x100 << pos;
+		} else {
 			while (size > 1) {
-				dbgf("split: %u, (%d, %d, %d)\n", pos, cx, cy, cz);
-				ot_split(o, node);
+				error = ot_split(o, node);
+				if (error)
+					return error;
 
 				pos = cell_get_pos(cx, cy, cz, x, y, z);
+				dbgf("split: %u, (%d, %d, %d)\n", pos, cx, cy, cz);
 				node = &node->data.children[pos];
 
 				cell_pos_update(&size, &cx, &cy, &cz, x, y, z);
@@ -170,7 +201,7 @@ void ot_set_cell(struct ot_pool *o, int x, int y, int z, block_t id)
 			// node has been split into size 2, now put block there
 			goto put;
 		}
-		return;
+		return 0;
 	}
 
 	// strategy: find closest node, split if bigger than 2, put block
@@ -178,10 +209,12 @@ void ot_set_cell(struct ot_pool *o, int x, int y, int z, block_t id)
 	while (size > 1) {
 		if ((node->type & ONT_TYPE_MASK) == ONT_CELL) {
 			while (size > 1) {
-				dbgf("split: %u, (%d, %d, %d)\n", pos, cx, cy, cz);
-				ot_split(o, node);
+				error = ot_split(o, node);
+				if (error)
+					return error;
 
 				pos = cell_get_pos(cx, cy, cz, x, y, z);
+				dbgf("split: %u, (%d, %d, %d)\n", pos, cx, cy, cz);
 				node = &node->data.children[pos];
 
 				cell_pos_update(&size, &cx, &cy, &cz, x, y, z);
@@ -201,14 +234,29 @@ put:
 	pos = cell_get_pos(cx, cy, cz, x, y, z);
 	dbgf("put  : %u, (%d, %d, %d)\n", pos, cx, cy, cz);
 	node->data.cells[pos] = id;
+	node->type |= 0x100 << pos;
+
+	return 0;
 }
+
+#define OT_CAP 1024
+#define OT_SIZE 256
 
 int main(void)
 {
+	if (ot_init(&ot_pool, OT_CAP, OT_SIZE)) {
+		fputs("ot_init failed\n", stderr);
+		return 1;
+	}
+
 	ot_set_cell(&ot_pool, -4, 2, -2, ID_STONE);
 	ot_set_cell(&ot_pool, 3, 3, -3, ID_STONE);
+	ot_set_cell(&ot_pool, 2, 3, -3, ID_GRASS);
 
 	printf("cell 0: %u\n", ot_get_cell(&ot_pool, -4, 2, -2));
 	printf("cell 1: %u\n", ot_get_cell(&ot_pool, 3, 3, -3));
+	printf("cell 2: %u\n", ot_get_cell(&ot_pool, 2, 3, -3));
+
+	ot_free(&ot_pool);
 	return 0;
 }
