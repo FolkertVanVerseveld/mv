@@ -1,4 +1,5 @@
 #!/bin/bash
+p=
 while :; do
 	inotifywait -qre modify server.c
 	make
@@ -7,5 +8,10 @@ while :; do
 		echo
 		continue
 	fi
-	./server
+	if [ ! -z $p ]; then
+		kill -9 $p
+		p=
+	fi
+	./server &
+	p=$!
 done
